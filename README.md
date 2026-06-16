@@ -1,8 +1,16 @@
 # exact-xahau — reference x402 facilitator for Xahau
 
-A runnable reference for the proposed `exact-xahau` x402 scheme
-(spec: [../docs/X402-XAHAU.md](../docs/X402-XAHAU.md)). It turns that proposal
-into working code so the design can be exercised and ratified.
+> **Standalone mirror.** This is the canonical standalone home of the x402-xahau
+> facilitator. It is also developed inside the **xahc** toolchain repo at
+> [`Hugegreencandle/xahc/x402-xahau`](https://github.com/Hugegreencandle/xahc/tree/main/x402-xahau),
+> where its companion tools live: the guardrail Hook is **written** with
+> [xahc](https://github.com/Hugegreencandle/xahc), **simulated** with
+> [xahau-mcp](https://github.com/Hugegreencandle/xahau-mcp), and **proven** safe with
+> [xahc-prover](https://github.com/Hugegreencandle/xahc-prover). MIT-licensed.
+
+A runnable reference for the proposed `exact-xahau` x402 scheme (spec:
+[`X402-XAHAU.md` in the xahc repo](https://github.com/Hugegreencandle/xahc/blob/main/docs/X402-XAHAU.md)).
+It turns that proposal into working code so the design can be exercised and ratified.
 
 ## What it does
 
