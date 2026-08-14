@@ -24,9 +24,11 @@ It turns that proposal into working code so the design can be exercised and rati
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /supported` | Advertise `{kinds:[{x402Version:2, scheme:"exact", network:"xahau"}]}` |
+| `GET /supported` | Advertise `{kinds:[{x402Version:2, scheme:"exact", network:"xahau"}]}` + the **OPTIONAL** `kv-provable-budget` extension (`extensions:[...]`) |
 | `POST /verify` | Offline checks on a signed Xahau Payment vs the x402 requirements |
-| `POST /settle` | Submit the signed tx to Xahau (`submitAndWait`) |
+| `POST /settle` | Submit the signed tx to Xahau (`submitAndWait`). The success receipt now **binds the payer's on-ledger guardrail `hookHash` + a prover-verdict pointer (`proofRef`/`proofClass`) into the SIGNED proof** (receipt v2) |
+| `GET /receipt/:id/verify` | **Re-verify a stored receipt** — ed25519 signature over the canonical bytes (which include `hookHash`/`proofRef`/`proofClass`, so a post-hoc swap ⇒ `verified:false`), plus an advisory live on-ledger `hookHash` re-check when `XAHAU_WSS` is set. Public, rate-limited, fail-closed |
+| `GET /extension/provable-budget/:account` | **Signed budget attestation** (`kv-provable-budget`) over the account's live on-ledger policy (per-tx `LIM`, period `PLM`/`PER`, real remaining), bound to its `hookHash` + proof pointer. A merchant verifies it offline against `/pubkey` — no need to trust the facilitator. Needs `XAHAU_WSS` (503 if unset) |
 | `GET /health` | Liveness JSON. **Minimal** `{ status, network, uptimeSec }` unauthenticated (LB probe); verbose internals require the shared secret |
 | `GET /metrics` | Counters as JSON (or Prometheus text on `Accept: text/plain`). **Auth-gated** behind the shared secret (open in reference mode) |
 | `GET /policy/:account` | **On-ledger budget introspection** — read the account's installed xahc guardrail Hook and surface its spending policy straight from the chain. For the **per-tx** guardrail: the `LIM` cap + `DST` allowlist (`stateful:false`). For the **stateful period-budget** guardrail: also the `PLM`/`PER` caps **and the agent's REAL remaining budget** read live from the Hook's on-chain `HookState` (`stateful:true`). Read-only, keyless, public. Needs `XAHAU_WSS` (503 if unset). Fail-transparent |
@@ -331,8 +333,9 @@ so it never affects verification — see the Hook-execution transparency note ab
 **Canonical-bytes recipe** (the verifier MUST reproduce these exact bytes):
 
 1. Build the object with **exactly** these keys (an absent value is the JSON literal
-   `null`, never dropped): `{ v: 1, network, txHash, payer, payTo, asset, delivered,
-   required, ts }`.
+   `null`, never dropped): `{ v: 2, network, txHash, payer, payTo, asset, delivered,
+   required, ts, hookHash, proofRef, proofClass }`. (v2 added the proof-carrying
+   `hookHash`/`proofRef`/`proofClass` binding — see below.)
 2. JSON-serialize with **keys sorted ascending at every level** and **no whitespace**
    (recursive; arrays keep order). Non-finite numbers are not allowed.
 3. UTF-8 encode → those are the signed bytes. Verify `proof.sig` (hex) against the bytes
@@ -354,9 +357,10 @@ const canon = (v) => v === null ? "null"
 function verifyReceipt(r, expectedPubkey) {
   const p = r.proof;
   if (!p || p.alg !== "ed25519" || p.pubkey !== expectedPubkey) return false;
-  const payload = { v: 1, network: r.network, txHash: r.txHash, payer: r.payer,
+  const payload = { v: 2, network: r.network, txHash: r.txHash, payer: r.payer,
     payTo: r.payTo, asset: r.asset ?? null, delivered: r.delivered ?? null,
-    required: r.required ?? null, ts: r.ts };
+    required: r.required ?? null, ts: r.ts,
+    hookHash: r.hookHash ?? null, proofRef: r.proofRef ?? null, proofClass: r.proofClass ?? null };
   const bytes = Buffer.from(canon(payload), "utf8");
   const key = crypto.createPublicKey({ format: "jwk",
     key: { kty: "OKP", crv: "Ed25519", x: Buffer.from(p.pubkey, "hex").toString("base64url") } });
@@ -368,6 +372,29 @@ The facilitator also **exports** `verifyReceipt(receipt, { expectedPubkey })` fr
 `server.mjs` for in-process verification. **Scope:** a receipt proves a settlement
 *occurred* (and the delivered amount), **not** future behavior. The on-ledger guardrail
 Hook (when installed) is the L1 spending authority — see `/policy/:account`.
+
+### Proof-carrying receipts (v2) + the `kv-provable-budget` extension
+
+A v2 success receipt binds the payer's on-ledger guardrail **`hookHash`** and a pointer to
+its (private) prover verdict — **`proofRef`** (a content-addressed digest of the xahc-prover
+verdict) + **`proofClass`** (the invariant proven, e.g. `guardrail`) — **into the signed
+bytes**. So the receipt asserts "this payment was governed by hook `H`, proven `P`, at the
+settlement ledger" and a post-hoc swap of `H`/`P` makes `GET /receipt/:id/verify` return
+`verified:false`. The facilitator never holds the prover artifact; it maps `hookHash →
+{proofRef, proofClass}` from the optional **`X402_PROOF_REGISTRY`** (a JSON object literal or a
+path to one). No entry ⇒ `hookHash` is still bound from the chain, `proofRef`/`proofClass` null.
+
+The same binding, presented ahead of a purchase, is the **`kv-provable-budget`** x402 extension:
+`GET /extension/provable-budget/:account` returns a **signed budget attestation** (per-tx `LIM`,
+period `PLM`/`PER`, real remaining, `hookHash`, `proofRef`, `proofClass`) that a merchant verifies
+offline against `/pubkey`. A reference merchant gate is in
+[`merchant/provable-budget-gate.mjs`](./merchant/provable-budget-gate.mjs): it verifies the
+signature, requires a `proofClass` (a proven invariant), and 402s unless the budget covers the
+price — **without trusting the facilitator that emitted it**. The extension is advertised in
+`GET /supported` but is **OPTIONAL**: the merchant's app gate enforces it, the protocol does not.
+
+See [`demo/split-attack.mjs`](./demo/split-attack.mjs) for why an off-chain per-call budget check
+cannot bound an agent (the *split attack*) and the stateful guardrail can.
 
 ## Operational hardening
 

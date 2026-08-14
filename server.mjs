@@ -477,8 +477,9 @@ function checkIssuedAmount(amount, asset, maxTokenValue) {
 //
 // CANONICAL BYTES RECIPE (the verifier MUST reconstruct these exact bytes):
 //   1. Build the object { v, network, txHash, payer, payTo, asset, delivered,
-//      required, ts } using EXACTLY these keys (omit none; an absent value is the
-//      JSON literal null, never undefined-dropped).
+//      required, ts, hookHash, proofRef, proofClass } using EXACTLY these keys
+//      (omit none; an absent value is the JSON literal null, never undefined-dropped).
+//      v is 2 (v2 added the proof-carrying hookHash/proofRef/proofClass binding).
 //   2. JSON.stringify with keys sorted ascending and NO whitespace
 //      (canonicalJSONStringify below: deterministic key order, recursive).
 //   3. UTF-8 encode -> those are the signed bytes.
@@ -520,9 +521,9 @@ function canonicalJSONStringify(value) {
  * canonical bytes match. `delivered`/`asset` may be null (native vs IOU); we keep
  * the key present with a null value rather than dropping it, so the shape is fixed.
  */
-function receiptSignablePayload({ network, txHash, payer, payTo, asset, delivered, required, ts }) {
+function receiptSignablePayload({ network, txHash, payer, payTo, asset, delivered, required, ts, hookHash, proofRef, proofClass }) {
   return {
-    v: 1,
+    v: 2,
     network: network ?? null,
     txHash: txHash ?? null,
     payer: payer ?? null,
@@ -531,6 +532,16 @@ function receiptSignablePayload({ network, txHash, payer, payTo, asset, delivere
     delivered: delivered ?? null,
     required: required ?? null,
     ts: ts ?? null,
+    // v2 — proof-carrying binding. hookHash = the guardrail Hook that governed the
+    // PAYER's account at settlement (SHA-512Half, read on-ledger). proofRef = a
+    // content-addressed digest of the (private) xahc-prover verdict for that exact
+    // HookHash; proofClass = the invariant name proven (e.g. "guardrail"). All three
+    // are SIGNED, so a post-hoc swap of the hook/proof breaks the signature. Null when
+    // no hook is installed / no proof is registered (the receipt still proves the
+    // settlement occurred — it just carries no governance binding).
+    hookHash: hookHash ?? null,
+    proofRef: proofRef ?? null,
+    proofClass: proofClass ?? null,
   };
 }
 
@@ -661,6 +672,9 @@ export function verifyReceipt(receipt, { expectedPubkey } = {}) {
       delivered: receipt.delivered,
       required: receipt.required,
       ts: receipt.ts,
+      hookHash: receipt.hookHash,
+      proofRef: receipt.proofRef,
+      proofClass: receipt.proofClass,
     });
     const bytes = Buffer.from(canonicalJSONStringify(payload), "utf8");
     const rawPub = Buffer.from(proof.pubkey, "hex");
@@ -672,6 +686,139 @@ export function verifyReceipt(receipt, { expectedPubkey } = {}) {
   } catch {
     return false; // any parse/crypto error -> NOT verified (never throw, never fabricate)
   }
+}
+
+// ---------------------------------------------------------------------------
+// FEATURE 6 — kv-provable-budget: a signed x402 v2 EXTENSION
+// ---------------------------------------------------------------------------
+// The agent's spending authority is an ON-CHAIN rule (its xahc guardrail Hook),
+// formally proven by xahc-prover. This extension lets a MERCHANT gate access on
+// that proven authority WITHOUT trusting the facilitator: the facilitator emits a
+// budget ATTESTATION signed by the SAME ed25519 receipt key (GET /pubkey), binding
+// the account's on-ledger HookHash + proof pointer (proofRef/proofClass) + the live
+// policy (per-tx LIM, period PLM/PER, REAL remaining budget from HookState). A
+// merchant verifies the signature offline, checks proofClass is present (a PROVEN
+// invariant) and that the budget covers the price, and 402s otherwise. The facilitator
+// can populate a NUMBER but cannot forge `proofClass` + a matching `proofRef` for a
+// hook it did not prove — that binding is the moat, not this envelope.
+
+const EXTENSION_NAME = "kv-provable-budget";
+const EXTENSION_VERSION = 1;
+
+/**
+ * Sign the canonical bytes of ANY payload object with the facilitator's ed25519
+ * receipt key. Returns { alg, pubkey, sig } (hex), or null on failure. Shared by
+ * receipts and budget attestations so both use the identical canonicalization.
+ */
+function signCanonical(payload) {
+  try {
+    initReceiptKey();
+    const bytes = Buffer.from(canonicalJSONStringify(payload), "utf8");
+    const sig = crypto.sign(null, bytes, _receiptKey.privateKey);
+    return { alg: "ed25519", pubkey: _receiptKey.pubHex, sig: sig.toString("hex") };
+  } catch (e) {
+    log("warn", "attestation_sign_failed", { error: String(e?.name || "sign_error") });
+    return null;
+  }
+}
+
+/**
+ * Verify an ed25519 `proof` over the canonical bytes of `payload`. Mirrors
+ * verifyReceipt's checks (alg/pubkey/sig shape, optional expectedPubkey pin).
+ * NEVER throws; any parse/crypto failure -> false.
+ */
+function verifyCanonical(payload, proof, expectedPubkey) {
+  try {
+    if (!proof || typeof proof !== "object") return false;
+    if (proof.alg !== "ed25519") return false;
+    if (typeof proof.pubkey !== "string" || !/^[0-9a-fA-F]{64}$/.test(proof.pubkey)) return false;
+    if (typeof proof.sig !== "string" || !/^[0-9a-fA-F]+$/.test(proof.sig) || proof.sig.length % 2 !== 0) return false;
+    if (expectedPubkey !== undefined && proof.pubkey.toLowerCase() !== String(expectedPubkey).toLowerCase()) return false;
+    const bytes = Buffer.from(canonicalJSONStringify(payload), "utf8");
+    const rawPub = Buffer.from(proof.pubkey, "hex");
+    const pubKeyObj = crypto.createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: rawPub.toString("base64url") }, format: "jwk" });
+    return crypto.verify(null, bytes, pubKeyObj, Buffer.from(proof.sig, "hex"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Project a budget attestation to its canonical, signable payload. Fixed key set;
+ * absent values are null (never dropped) so signer + verifier reconstruct identical
+ * bytes. Amounts are drops STRINGS (or null). `remaining` is the REAL remaining
+ * period budget from HookState for a stateful guardrail; null for a per-tx cap.
+ */
+function attestationSignablePayload({ account, hookHash, proofRef, proofClass, stateful, perTxLimitDrops, periodLimitDrops, periodLedgers, remaining, asOfLedger, ts }) {
+  return {
+    v: 1,
+    kind: EXTENSION_NAME,
+    account: account ?? null,
+    hookHash: hookHash ?? null,
+    proofRef: proofRef ?? null,
+    proofClass: proofClass ?? null,
+    stateful: stateful === true,
+    perTxLimitDrops: perTxLimitDrops ?? null,
+    periodLimitDrops: periodLimitDrops ?? null,
+    periodLedgers: periodLedgers ?? null,
+    remaining: remaining ?? null,
+    asOfLedger: asOfLedger ?? null,
+    ts: ts ?? null,
+  };
+}
+
+/** Sign a budget attestation's fields. Returns { alg, pubkey, sig } or null. */
+function signAttestation(fields) {
+  return signCanonical(attestationSignablePayload(fields));
+}
+
+/**
+ * Offline-verify a budget attestation object `{ ...fields, proof }` against the
+ * facilitator's key. Reconstructs the signable bytes from the attestation's OWN
+ * fields (a tampered field changes the bytes -> false). Exported for merchants.
+ */
+export function verifyAttestation(att, { expectedPubkey } = {}) {
+  if (!att || typeof att !== "object") return false;
+  const payload = attestationSignablePayload({
+    account: att.account, hookHash: att.hookHash, proofRef: att.proofRef, proofClass: att.proofClass,
+    stateful: att.stateful, perTxLimitDrops: att.perTxLimitDrops, periodLimitDrops: att.periodLimitDrops,
+    periodLedgers: att.periodLedgers, remaining: att.remaining, asOfLedger: att.asOfLedger, ts: att.ts,
+  });
+  return verifyCanonical(payload, att.proof, expectedPubkey);
+}
+
+/**
+ * Build a SIGNED budget attestation for `account` from the live on-ledger policy.
+ * Composes getPolicy (per-tx / stateful decode) + readGuardrailHook (HookHash) +
+ * the proof registry (proofRef/proofClass). Returns the attestation object incl.
+ * `proof`, or { account, error } fail-transparently (never a fabricated budget).
+ * `now` is injectable for deterministic tests.
+ */
+async function buildBudgetAttestation(client, account, now = Date.now()) {
+  const pol = await getPolicy(client, account);
+  const { hookHash } = await readGuardrailHook(client, account);
+  const { proofRef, proofClass } = proofBindingFor(hookHash);
+  const p = pol.policy || {};
+  const fields = {
+    account,
+    hookHash: hookHash ?? null,
+    proofRef, proofClass,
+    stateful: p.stateful === true,
+    perTxLimitDrops: p.perTxLimitDrops ?? null,
+    periodLimitDrops: p.periodLimitDrops ?? null,
+    periodLedgers: p.periodLedgers ?? null,
+    remaining: p.remaining ?? null,
+    asOfLedger: pol.asOfLedger ?? null,
+    ts: now,
+  };
+  const proof = signAttestation(fields);
+  return {
+    extension: EXTENSION_NAME, version: EXTENSION_VERSION,
+    ...fields,
+    guardrailHookPresent: pol.guardrailHookPresent,
+    policyNote: pol.note ?? p.note ?? null,
+    proof,
+  };
 }
 
 /**
@@ -1226,6 +1373,91 @@ async function guardrailHookPresent(client, account) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Pull the installed guardrail HookHash off an account_objects "hook" entry.
+ * account_objects may expose the hash directly (`HookHash`) or nested under the
+ * SetHook layout (`{ Hooks: [ { Hook: { HookHash } } ] }`). Returns the first
+ * 64-hex HookHash found (uppercased), or null. Pure + defensive (never throws).
+ */
+function extractHookHash(objs) {
+  const isHash = (h) => typeof h === "string" && /^[0-9A-Fa-f]{64}$/.test(h);
+  for (const o of Array.isArray(objs) ? objs : []) {
+    if (Array.isArray(o?.Hooks)) {
+      for (const hh of o.Hooks) {
+        const h = hh?.Hook?.HookHash ?? hh?.HookHash;
+        if (isHash(h)) return h.toUpperCase();
+      }
+    }
+    const direct = o?.HookHash ?? o?.Hook?.HookHash;
+    if (isHash(direct)) return direct.toUpperCase();
+  }
+  return null;
+}
+
+/**
+ * Read the PAYER's installed guardrail Hook: whether one is present AND its
+ * HookHash (the identity of the on-ledger rule that governed the account). Returns
+ * { present: bool|null, hookHash: string|null }. `present` keeps the same tri-state
+ * as guardrailHookPresent (null = could-not-determine). hookHash is null when no
+ * hook is installed or the shape is unreadable. Read at the validated ledger.
+ */
+async function readGuardrailHook(client, account) {
+  try {
+    const r = await client.request({ command: "account_objects", account, type: "hook", ledger_index: "validated" });
+    const objs = r?.result?.account_objects || [];
+    if (objs.length === 0) return { present: false, hookHash: null };
+    return { present: true, hookHash: extractHookHash(objs) };
+  } catch {
+    return { present: null, hookHash: null };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Proof registry — bind an on-ledger HookHash to a (private) prover verdict.
+// ---------------------------------------------------------------------------
+// The facilitator NEVER holds the prover artifact (the moat stays private). It
+// holds only a content-addressed POINTER: X402_PROOF_REGISTRY maps a HookHash to
+// { proofRef, proofClass }. proofRef = the digest/URI of the xahc-prover verdict
+// for that exact bytecode; proofClass = the invariant proven (e.g. "guardrail").
+// These are SIGNED into the receipt (see receiptSignablePayload v2), so a receipt
+// can assert "this account was governed by hook H, proven P" without the verifier
+// trusting the facilitator to re-run anything. Absent/invalid registry -> no
+// binding (proofRef/proofClass null); hookHash is still bound from the chain.
+let _proofRegistry, _proofRegistryKey;
+function proofRegistry(env = process.env) {
+  const raw = env.X402_PROOF_REGISTRY;
+  // Cache keyed on the raw env string: reloads if the registry changes (and lets
+  // tests re-point it) without re-parsing on every call in steady state.
+  if (_proofRegistry !== undefined && _proofRegistryKey === raw) return _proofRegistry;
+  _proofRegistryKey = raw;
+  _proofRegistry = {};
+  if (typeof raw === "string" && raw.trim().length) {
+    try {
+      let text = raw.trim();
+      // A JSON object literal, or a path to a JSON file with the same shape.
+      if (!text.startsWith("{")) { text = require_("node:fs").readFileSync(text, "utf8"); }
+      const parsed = JSON.parse(text);
+      for (const [k, v] of Object.entries(parsed || {})) {
+        if (/^[0-9A-Fa-f]{64}$/.test(k) && v && typeof v === "object") {
+          _proofRegistry[k.toUpperCase()] = {
+            proofRef: typeof v.proofRef === "string" ? v.proofRef : null,
+            proofClass: typeof v.proofClass === "string" ? v.proofClass : null,
+          };
+        }
+      }
+    } catch {
+      logWarn("proof_registry_invalid", { note: "X402_PROOF_REGISTRY set but not valid JSON / readable file — no proof bindings loaded" });
+    }
+  }
+  return _proofRegistry;
+}
+/** The { proofRef, proofClass } bound to a HookHash, or nulls if none. */
+function proofBindingFor(hookHash, env = process.env) {
+  if (!hookHash) return { proofRef: null, proofClass: null };
+  const e = proofRegistry(env)[hookHash.toUpperCase()];
+  return e ? { proofRef: e.proofRef, proofClass: e.proofClass } : { proofRef: null, proofClass: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -2220,7 +2452,11 @@ async function settle(payload, req, _deps = {}) {
   const expiryMs = consumedExpiryFor(replayCtx, now);
 
   // (3) Honestly report whether the payer's guardrail Hook is installed.
-  const hookPresent = await guardrailHookPresent(client, tx.Account);
+  // Read the payer's guardrail Hook: presence (tri-state, as before) AND its HookHash
+  // — the identity of the on-ledger rule that governed this account at settlement.
+  // proofRef/proofClass bind that HookHash to a (private) prover verdict, if registered.
+  const { present: hookPresent, hookHash: guardrailHookHash } = await readGuardrailHook(client, tx.Account);
+  const { proofRef: guardrailProofRef, proofClass: guardrailProofClass } = proofBindingFor(guardrailHookHash);
 
   // ATOMIC reserve before submission: two concurrent / multi-instance /settle calls
   // for the same payment can't BOTH win. reserve() is a single atomic test-and-set
@@ -2423,6 +2659,13 @@ async function settle(payload, req, _deps = {}) {
   // signature fails). Native = null on both sides.
   receipt.asset = v.asset ?? null;
   receipt.ts = ts;
+  // v2 proof-carrying binding — SIGNED. hookHash = the guardrail Hook governing the
+  // payer at settlement; proofRef/proofClass = the pointer to its (private) prover
+  // verdict. Surfaced on the receipt so a verifier reconstructs the SAME signed bytes;
+  // a post-hoc swap of any of these breaks the signature (see /receipt/:id/verify).
+  receipt.hookHash = guardrailHookHash ?? null;
+  receipt.proofRef = guardrailProofRef ?? null;
+  receipt.proofClass = guardrailProofClass ?? null;
   if (receipt.success === true) {
     receipt.proof = signReceipt({
       network: NETWORK,
@@ -2433,6 +2676,9 @@ async function settle(payload, req, _deps = {}) {
       delivered: receipt.delivered ?? null,
       required: requiredField,
       ts,
+      hookHash: receipt.hookHash,
+      proofRef: receipt.proofRef,
+      proofClass: receipt.proofClass,
     });
   } else {
     receipt.proof = null; // failed/rejected settlements are not signed
@@ -2957,8 +3203,37 @@ function serve() {
 
       if (req.method === "GET" && req.url === "/supported")
         // x402 discovery: { kinds: [{ x402Version, scheme, network }] }. We add the
-        // spec's `x402Version: 2` alongside the original {scheme, network}.
-        return send(res, 200, { kinds: [{ x402Version: 2, scheme: "exact", network: NETWORK }] });
+        // spec's `x402Version: 2` alongside the original {scheme, network}, plus the
+        // OPTIONAL kv-provable-budget extension (see FEATURE 6). Extensions are
+        // advisory: a merchant's app gate enforces them, the protocol does not.
+        return send(res, 200, {
+          kinds: [{ x402Version: 2, scheme: "exact", network: NETWORK }],
+          extensions: [{
+            name: EXTENSION_NAME,
+            version: EXTENSION_VERSION,
+            optional: true,
+            description: "Signed attestation that the payer's account is governed by a formally-proven on-chain guardrail Hook (per-tx LIM + period PLM/PER, real remaining budget), bound to its HookHash + prover-verdict pointer. Fetch via GET /extension/provable-budget/:account; verify offline against GET /pubkey.",
+            endpoint: "/extension/provable-budget/:account",
+            fields: ["account", "hookHash", "proofRef", "proofClass", "stateful", "perTxLimitDrops", "periodLimitDrops", "periodLedgers", "remaining", "asOfLedger", "ts", "proof"],
+          }],
+        });
+
+      // FEATURE 6 — GET /extension/provable-budget/:account: a SIGNED budget
+      // attestation over the account's live on-ledger guardrail policy. Public,
+      // read-only, rate-limited (on-ledger data). Needs XAHAU_WSS (503 if unset).
+      // FAIL-TRANSPARENT: node/decoding errors -> honest error, never a fake budget.
+      if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/extension/provable-budget/")) {
+        const ip = clientIp(req);
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
+        const account = decodeURIComponent(req.url.slice("/extension/provable-budget/".length).split("?")[0]);
+        if (!isValidRAddress(account)) return send(res, 400, { error: "invalid account address" });
+        if (!process.env.XAHAU_WSS) return send(res, 503, { error: "node not configured (set XAHAU_WSS)" });
+        let client;
+        try { client = await getClient(); }
+        catch { return send(res, 503, { account, error: "node unavailable — attestation unavailable" }); }
+        const att = await buildBudgetAttestation(client, account);
+        return send(res, 200, att);
+      }
 
       // FEATURE 2 — GET /pubkey: the facilitator's ed25519 receipt verification key
       // (raw 32-byte hex). Public (a verification key is not a secret). Lets a resource
@@ -3012,6 +3287,59 @@ function serve() {
         // No receipt. The binding may still be live (in-flight) but we only expose the
         // receipt store here; report "unknown" honestly rather than guessing.
         return send(res, 200, { found: false, status: "unknown" });
+      }
+
+      // FEATURE 5 — GET /receipt/:id/verify: re-verify a stored settlement receipt.
+      // PUBLIC + rate-limited (it returns only on-ledger-public / facilitator-issued
+      // fields, no amounts/PII). Load-bearing check = the ed25519 signature over the
+      // canonical bytes, which INCLUDE hookHash + proofRef + proofClass — so a post-hoc
+      // swap of the governing hook or its proof pointer makes verified:false. When
+      // XAHAU_WSS is set, ALSO re-reads the payer's currently-installed HookHash and
+      // reports whether it still matches (advisory; a later hook change does not unsign
+      // the receipt). FAIL-CLOSED: any signature/parse failure -> verified:false.
+      if (req.method === "GET" && typeof req.url === "string" && req.url.startsWith("/receipt/") && req.url.replace(/\?.*$/, "").endsWith("/verify")) {
+        const ip = clientIp(req);
+        if (!(await rateLimiter.ok(ip))) { metricInc("rate_limited_total"); return send(res, 429, { error: "rate limited" }); }
+        const rest = req.url.slice("/receipt/".length).replace(/\?.*$/, "");
+        const id = decodeURIComponent(rest.slice(0, rest.length - "/verify".length).replace(/\/$/, ""));
+        if (!id) return send(res, 400, { error: "missing id" });
+        let receipt;
+        try { receipt = await store.getReceipt(id); }
+        catch { return send(res, 503, { found: false, verified: false, verdict: "unknown", error: "store unavailable", retryable: true }); }
+        if (!receipt) return send(res, 200, { found: false, verified: false, verdict: "unknown", note: "no stored receipt for id" });
+        const expectedPubkey = receiptPubkey().pubkey;
+        const signatureValid = verifyReceipt(receipt, { expectedPubkey }) === true;
+        // Optional live on-ledger consistency: does the payer STILL run the same hook?
+        let onChainHookMatch = null;
+        let note = "live hook re-check not run (set XAHAU_WSS to enable)";
+        if (process.env.XAHAU_WSS && receipt.payer && receipt.hookHash) {
+          try {
+            const client = await getClient();
+            const live = await readGuardrailHook(client, receipt.payer);
+            onChainHookMatch = !!(live.hookHash && live.hookHash.toUpperCase() === String(receipt.hookHash).toUpperCase());
+            note = onChainHookMatch
+              ? "payer's installed guardrail HookHash still matches the receipt"
+              : "payer's installed HookHash no longer matches the receipt (hook changed/removed since settlement) — the SIGNED binding still stands for that ledger";
+          } catch { onChainHookMatch = null; note = "node unavailable — live hook re-check skipped; the signature stands on its own"; }
+        }
+        return send(res, 200, {
+          found: true,
+          verified: signatureValid,          // load-bearing: the signature is the proof
+          verdict: signatureValid ? "valid" : "invalid",
+          signatureValid,
+          expectedPubkey,
+          onChainHookMatch,                   // advisory (true/false/null)
+          note,
+          receipt: {
+            txHash: receipt.txHash ?? null,
+            payer: receipt.payer ?? null,
+            payTo: receipt.payTo ?? null,
+            hookHash: receipt.hookHash ?? null,
+            proofRef: receipt.proofRef ?? null,
+            proofClass: receipt.proofClass ?? null,
+            ts: receipt.ts ?? null,
+          },
+        });
       }
 
       // FEATURE 4 — POST /simulate: predict the guardrail Hook's accept/rollback for a
@@ -3195,6 +3523,11 @@ export const __test = {
   // FEATURE 2 — receipt signing/verification seams.
   canonicalJSONStringify, receiptSignablePayload, signReceipt, verifyReceipt,
   receiptPubkey, initReceiptKey, parseReceiptSecret, ed25519KeyFromSeed,
+  // FEATURE 5 — proof-carrying receipt binding (hookHash + prover-verdict pointer).
+  readGuardrailHook, extractHookHash, proofRegistry, proofBindingFor,
+  // FEATURE 6 — kv-provable-budget x402 extension (signed budget attestation).
+  signCanonical, verifyCanonical, attestationSignablePayload, signAttestation,
+  verifyAttestation, buildBudgetAttestation, EXTENSION_NAME, EXTENSION_VERSION,
   // FEATURE 4 — advisory simulation seam.
   simulatePayment,
   // Live view of the default store's backing map (back-compat with raw-Map tests).

@@ -2362,9 +2362,10 @@ await new Promise((resolveTest, rejectTest) => {
 
   // The signable projection has a FIXED key set; absent fields are null, not dropped.
   const proj = rsp({ network: "xahau", txHash: "H", payer: "rP", payTo: "rT" });
-  assert.deepEqual(Object.keys(proj).sort(), ["asset", "delivered", "network", "payTo", "payer", "required", "ts", "txHash", "v"], "fixed key set");
-  assert.equal(proj.v, 1, "version pinned");
+  assert.deepEqual(Object.keys(proj).sort(), ["asset", "delivered", "hookHash", "network", "payTo", "payer", "proofClass", "proofRef", "required", "ts", "txHash", "v"], "fixed key set (v2 adds hookHash/proofRef/proofClass)");
+  assert.equal(proj.v, 2, "version pinned (v2)");
   assert.equal(proj.delivered, null, "absent delivered -> null (not dropped)");
+  assert.equal(proj.hookHash, null, "absent hookHash -> null (not dropped)");
 
   // pubkey shape.
   const pk = receiptPubkey();
@@ -2563,6 +2564,217 @@ await new Promise((resolveTest, rejectTest) => {
   }
 
   if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// FEATURE 5 — proof-carrying receipt: settle binds the payer's on-ledger guardrail
+// HookHash + a registered prover-verdict pointer INTO the SIGNED bytes, so a post-hoc
+// swap of the hook or its proof pointer breaks verification (the red-team property).
+{
+  const prev = process.env.XAHAU_WSS;
+  const prevReg = process.env.X402_PROOF_REGISTRY;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { InMemoryStore, verifyReceipt, extractHookHash, proofBindingFor } = __test;
+  const now = 1_000_000_000, curLedger = 100;
+  const HOOKHASH = "A".repeat(64);
+
+  // extractHookHash: nested SetHook layout, direct field, none, hostile input.
+  assert.equal(extractHookHash([{ Hooks: [{ Hook: { HookHash: HOOKHASH } }] }]), HOOKHASH, "nested Hooks[].Hook.HookHash extracted");
+  assert.equal(extractHookHash([{ HookHash: HOOKHASH.toLowerCase() }]), HOOKHASH, "direct HookHash extracted + uppercased");
+  assert.equal(extractHookHash([{ Foo: 1 }]), null, "no hook -> null");
+  assert.equal(extractHookHash([]), null, "empty -> null");
+  assert.equal(extractHookHash("nope"), null, "non-array -> null (never throws)");
+
+  // A client whose account_objects returns a guardrail hook carrying HOOKHASH.
+  const hookedClient = {
+    isConnected: () => true,
+    request: async () => ({ result: { account_objects: [{ Hooks: [{ Hook: { HookHash: HOOKHASH } }] }] } }),
+    submitAndWait: async () => ({ result: { hash: "PCHASH", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } }),
+  };
+
+  // (a) No proof registered -> hookHash bound from chain, proofRef/proofClass null.
+  process.env.X402_PROOF_REGISTRY = "";
+  {
+    const store = new InMemoryStore({ now: () => now });
+    const deps = { store, client: hookedClient, currentValidatedLedger: async () => curLedger, now: () => now };
+    const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 480 }) }, req, deps);
+    assert.equal(out.success, true, `hooked settle succeeds: ${out.errorReason}`);
+    assert.equal(out.hookHash, HOOKHASH, "receipt binds the on-ledger HookHash");
+    assert.equal(out.proofRef, null, "no registry -> proofRef null");
+    assert.equal(out.proofClass, null, "no registry -> proofClass null");
+    assert.equal(verifyReceipt(out), true, "hook-bound receipt verifies offline");
+    assert.equal(verifyReceipt({ ...out, hookHash: "B".repeat(64) }), false, "swapping hookHash post-sign -> verification FAILS");
+    assert.equal(verifyReceipt({ ...out, hookHash: null }), false, "stripping hookHash -> verification FAILS");
+  }
+
+  // (b) Proof registered for HOOKHASH -> proofRef/proofClass bound AND signed.
+  process.env.X402_PROOF_REGISTRY = JSON.stringify({ [HOOKHASH]: { proofRef: "sha256:deadbeef", proofClass: "guardrail" } });
+  assert.deepEqual(proofBindingFor(HOOKHASH), { proofRef: "sha256:deadbeef", proofClass: "guardrail" }, "registry binds the hookHash");
+  assert.deepEqual(proofBindingFor("C".repeat(64)), { proofRef: null, proofClass: null }, "unregistered hook -> null binding");
+  {
+    const store = new InMemoryStore({ now: () => now });
+    const deps = { store, client: hookedClient, currentValidatedLedger: async () => curLedger, now: () => now };
+    const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 481 }) }, req, deps);
+    assert.equal(out.hookHash, HOOKHASH, "receipt binds HookHash");
+    assert.equal(out.proofRef, "sha256:deadbeef", "receipt binds proofRef from registry");
+    assert.equal(out.proofClass, "guardrail", "receipt binds proofClass from registry");
+    assert.equal(verifyReceipt(out), true, "proof-bound receipt verifies offline");
+    // RED-TEAM: swap the proof pointer AFTER signing -> verification FAILS (the point).
+    assert.equal(verifyReceipt({ ...out, proofRef: "sha256:0000" }), false, "swapping proofRef post-sign -> verification FAILS");
+    assert.equal(verifyReceipt({ ...out, proofClass: "limit" }), false, "swapping proofClass post-sign -> verification FAILS");
+  }
+
+  // (c) A non-hooked account (account_objects empty) -> hookHash null, still verifies.
+  process.env.X402_PROOF_REGISTRY = "";
+  {
+    const store = new InMemoryStore({ now: () => now });
+    const clientNoHook = fakeClient({ result: { hash: "NOHOOKPC", meta: { TransactionResult: "tesSUCCESS", delivered_amount: "1000000" } } });
+    const deps = { store, client: clientNoHook, currentValidatedLedger: async () => curLedger, now: () => now };
+    const out = await __test.settle({ txBlob: blob({ LastLedgerSequence: curLedger + 5, Sequence: 482 }) }, req, deps);
+    assert.equal(out.hookHash, null, "no installed hook -> hookHash null");
+    assert.equal(verifyReceipt(out), true, "non-hooked receipt still verifies (binding is null on both sides)");
+  }
+
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+  if (prevReg === undefined) delete process.env.X402_PROOF_REGISTRY; else process.env.X402_PROOF_REGISTRY = prevReg;
+}
+
+// FEATURE 5 route — GET /receipt/:id/verify over a spawned server. The verified:true
+// path needs a live node to settle, so here we assert the ROUTE is wired and the
+// fail-closed unknown-id path returns found:false, verified:false (no node needed).
+await new Promise((resolveTest, rejectTest) => {
+  (async () => {
+    const { spawn } = await import("node:child_process");
+    const PORT = 4092;
+    const child = spawn(process.execPath, ["server.mjs"], {
+      env: { ...process.env, PORT: String(PORT), XAHAU_WSS: "", X402_RECEIPT_SECRET: "07".repeat(32) },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const getJson = (path) => new Promise((res) => {
+      const r = http.request({ host: "127.0.0.1", port: PORT, path, method: "GET" }, (resp) => {
+        let d = ""; resp.on("data", (c) => (d += c));
+        resp.on("end", () => { let body; try { body = JSON.parse(d); } catch { body = d; } res({ status: resp.statusCode, body }); });
+      });
+      r.on("error", () => res({ status: null, body: null })); r.end();
+    });
+    const waitListen = async () => { for (let i = 0; i < 50; i++) { const ok = await new Promise((res) => { const r = http.request({ host: "127.0.0.1", port: PORT, path: "/supported", method: "GET" }, (resp) => { resp.resume(); res(resp.statusCode === 200); }); r.on("error", () => res(false)); r.end(); }); if (ok) return true; await new Promise((r) => setTimeout(r, 100)); } return false; };
+    try {
+      assert.equal(await waitListen(), true, "facilitator should start for the /receipt/verify test");
+      const v = await getJson("/receipt/does-not-exist/verify");
+      assert.equal(v.status, 200, "/receipt/:id/verify returns 200");
+      assert.equal(v.body.found, false, "unknown id -> found:false");
+      assert.equal(v.body.verified, false, "unknown id -> verified:false (fail-closed)");
+      assert.equal(v.body.verdict, "unknown", "unknown id -> verdict unknown");
+      // FEATURE 6 — /supported advertises the kv-provable-budget extension.
+      const sup = await getJson("/supported");
+      assert.equal(sup.status, 200, "/supported returns 200");
+      assert.ok(Array.isArray(sup.body.extensions), "/supported carries an extensions array");
+      assert.equal(sup.body.extensions[0].name, "kv-provable-budget", "advertises the kv-provable-budget extension");
+      assert.equal(sup.body.extensions[0].optional, true, "extension advertised as OPTIONAL");
+      // /extension/provable-budget/:account with XAHAU_WSS unset -> 503 (never fabricates).
+      const ext = await getJson(`/extension/provable-budget/${PAYER}`);
+      assert.equal(ext.status, 503, "extension endpoint 503s when node unconfigured");
+      resolveTest();
+    } catch (e) { rejectTest(e); }
+    finally { child.kill("SIGKILL"); }
+  })().catch(rejectTest);
+});
+
+// FEATURE 6 — kv-provable-budget extension: signed budget attestation (roundtrip +
+// tamper), buildBudgetAttestation over a fake guardrail, and the merchant gate.
+{
+  const prev = process.env.XAHAU_WSS;
+  process.env.XAHAU_WSS = "wss://invalid.example";
+  const { signAttestation, verifyAttestation, attestationSignablePayload, receiptPubkey, buildBudgetAttestation, EXTENSION_NAME } = __test;
+  const pk = receiptPubkey().pubkey;
+  const HH = "E".repeat(64);
+
+  // Canonical projection: fixed key set incl. kind.
+  const proj = attestationSignablePayload({ account: PAYER });
+  assert.deepEqual(Object.keys(proj).sort(), ["account", "asOfLedger", "hookHash", "kind", "perTxLimitDrops", "periodLedgers", "periodLimitDrops", "proofClass", "proofRef", "remaining", "stateful", "ts", "v"], "attestation fixed key set");
+  assert.equal(proj.kind, EXTENSION_NAME, "kind is kv-provable-budget");
+
+  // Roundtrip + tamper over a STATEFUL attestation (real remaining budget).
+  const fields = { account: PAYER, hookHash: HH, proofRef: "sha256:abc", proofClass: "guardrail", stateful: true, perTxLimitDrops: "5000000", periodLimitDrops: "10000000", periodLedgers: "100", remaining: "7000000", asOfLedger: 42, ts: 1700000000000 };
+  const proof = signAttestation(fields);
+  assert.ok(proof && proof.alg === "ed25519", "signAttestation returns an ed25519 proof");
+  const att = { ...fields, proof };
+  assert.equal(verifyAttestation(att), true, "attestation verifies offline");
+  assert.equal(verifyAttestation(att, { expectedPubkey: pk }), true, "verifies against expected pubkey");
+  assert.equal(verifyAttestation(att, { expectedPubkey: "00".repeat(32) }), false, "wrong pubkey -> false");
+  for (const k of ["account", "hookHash", "proofRef", "proofClass", "remaining", "perTxLimitDrops", "asOfLedger", "stateful"]) {
+    const t = { ...att, [k]: (typeof att[k] === "boolean" ? !att[k] : typeof att[k] === "number" ? att[k] + 1 : "TAMPERED") };
+    assert.equal(verifyAttestation(t), false, `tampered ${k} -> attestation verify fails`);
+  }
+  assert.equal(verifyAttestation({ ...att, proof: null }), false, "no proof -> false");
+
+  // buildBudgetAttestation over a fake PER-TX guardrail (LIM=5 XAH, HookHash HH), with a
+  // proof registered for HH so the built attestation carries a real proofClass binding.
+  const prevReg = process.env.X402_PROOF_REGISTRY;
+  process.env.X402_PROOF_REGISTRY = JSON.stringify({ [HH]: { proofRef: "sha256:built", proofClass: "guardrail" } });
+  const LIMHEX = (5000000).toString(16).toUpperCase().padStart(16, "0");
+  const perTxClient = {
+    isConnected: () => true,
+    request: async ({ command }) => {
+      if (command === "account_objects") return { result: { account_objects: [{ Hooks: [{ Hook: { HookHash: HH, HookParameters: [{ HookParameter: { HookParameterName: "4C494D", HookParameterValue: LIMHEX } }] } }] }] } };
+      if (command === "ledger") return { result: { ledger_index: 999, ledger: { ledger_index: 999, closed: true } } };
+      return { result: {} };
+    },
+  };
+  const attB = await buildBudgetAttestation(perTxClient, PAYER, 1700000000001);
+  assert.equal(attB.extension, EXTENSION_NAME, "built attestation carries extension name");
+  assert.equal(attB.hookHash, HH, "built attestation binds the on-ledger HookHash");
+  assert.equal(attB.perTxLimitDrops, "5000000", "built attestation surfaces the decoded per-tx LIM");
+  assert.equal(attB.proofClass, "guardrail", "built attestation binds the registered proofClass");
+  assert.equal(attB.stateful, false, "per-tx guardrail -> stateful false");
+  assert.equal(verifyAttestation(attB, { expectedPubkey: pk }), true, "built attestation verifies");
+
+  // Merchant gate (imported reference middleware).
+  const { checkProvableBudget } = await import("./merchant/provable-budget-gate.mjs");
+  assert.deepEqual(checkProvableBudget({ attestation: att, expectedPubkey: pk, priceDrops: "5000000" }), { ok: true }, "sufficient budget + proof -> ok");
+  { const g = checkProvableBudget({ attestation: att, expectedPubkey: pk, priceDrops: "8000000" }); assert.equal(g.ok, false); assert.equal(g.status, 402); assert.match(g.reason, /remaining budget/); }
+  { const nf = { ...fields, proofClass: null }; const g = checkProvableBudget({ attestation: { ...nf, proof: signAttestation(nf) }, expectedPubkey: pk, priceDrops: "1000000" }); assert.equal(g.ok, false); assert.match(g.reason, /proofClass/); }
+  { const g = checkProvableBudget({ attestation: { ...att, remaining: "999999999" }, expectedPubkey: pk, priceDrops: "1" }); assert.equal(g.ok, false); assert.match(g.reason, /signature/); }
+  { const nf = { ...fields, hookHash: null }; const g = checkProvableBudget({ attestation: { ...nf, proof: signAttestation(nf) }, expectedPubkey: pk, priceDrops: "1" }); assert.equal(g.ok, false); assert.match(g.reason, /guardrail Hook/); }
+  assert.deepEqual(checkProvableBudget({ attestation: attB, expectedPubkey: pk, priceDrops: "5000000" }), { ok: true }, "per-tx limit covers price -> ok");
+  { const g = checkProvableBudget({ attestation: attB, expectedPubkey: pk, priceDrops: "6000000" }); assert.equal(g.ok, false); assert.match(g.reason, /per-tx limit/); }
+
+  if (prevReg === undefined) delete process.env.X402_PROOF_REGISTRY; else process.env.X402_PROOF_REGISTRY = prevReg;
+  if (prev === undefined) delete process.env.XAHAU_WSS; else process.env.XAHAU_WSS = prev;
+}
+
+// DEMO — the split attack. Locks the demo's core logic so it cannot silently regress into
+// a strawman: the ungoverned agent MUST overspend via the split, the governed agent MUST
+// stay bounded by the stateful guardrail, and the guardrail rule MUST be genuinely bounded.
+{
+  const { periodBudgetStep, runUngoverned, runGoverned } = await import("./demo/split-attack.mjs");
+  const XAH = 1_000_000n;
+  const params = { LIM: 5n * XAH, PLM: 10n * XAH, PER: 1000 };
+  const calls = [0, 1, 2, 3].map((i) => ({ amt: 4n * XAH, ledger: 100 + i }));
+
+  const A = runUngoverned(calls, { perCallLimit: params.LIM, intendedBudget: params.PLM });
+  assert.equal(A.spent, "16000000", "ungoverned spends the full split (a per-call check never sums)");
+  assert.equal(A.insolvent, true, "ungoverned overspends its budget");
+  assert.equal(A.overspentBy, "6000000", "ungoverned overspends by 6 XAH");
+
+  const B = runGoverned(calls, params);
+  assert.equal(B.spent, "8000000", "governed agent bounded to 8 XAH");
+  assert.equal(B.withinBudget, true, "governed agent never exceeds PLM");
+  assert.equal(B.firstRejectAt, 2, "the 3rd call (index 2) is the first rejected — the split is caught");
+
+  // per-tx cap: a single over-LIM tx is rejected even with budget remaining.
+  const overTx = periodBudgetStep({ periodStart: 0, spent: 0n }, 6n * XAH, 100, params);
+  assert.equal(overTx.accept, false, "a single over-LIM tx is rejected (per-tx cap)");
+  assert.match(overTx.reason, /per-tx/);
+
+  // period rollover resets the running total.
+  const after = periodBudgetStep({ periodStart: 0, spent: 9n * XAH }, 4n * XAH, 1000, params);
+  assert.equal(after.accept, true, "a new period (ledger >= start+PER) resets spent -> now accepts");
+  assert.equal(after.state.spent.toString(), (4n * XAH).toString(), "spent reset then incremented");
+
+  // the bounded property: no sequence of accepted calls exceeds PLM within a period.
+  let st = { periodStart: 0, spent: 0n };
+  for (let i = 0; i < 20; i++) { st = periodBudgetStep(st, 3n * XAH, 10, params).state; }
+  assert.ok(st.spent <= params.PLM, "cumulative accepted spend never exceeds PLM within a period");
 }
 
 // FEATURE 2 — GET /pubkey over a spawned server, and the EPHEMERAL-key warning path.

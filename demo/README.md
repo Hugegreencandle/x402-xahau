@@ -19,6 +19,25 @@ A real testnet run with on-ledger-verified transaction hashes is in [`DEMO-RUN.m
 | `resource-server.mjs` | A tiny x402 **resource server**. Sells `GET /premium` (1 XAH) and `GET /premium-plus` (10 XAH). Returns `402` + `paymentRequirements` with no payment; on an `X-PAYMENT` retry it calls the facilitator `/verify` then `/settle`, and grants/denies based on the real settlement. |
 | `agent.mjs` | The autonomous **agent**. Hits a resource, parses the 402, signs a Payment (NetworkID 21338, 0.1 XAH fee for Hook execution, `LastLedgerSequence` ahead), retries with `X-PAYMENT`, and prints each step + the on-chain outcome. |
 
+## The split attack (`split-attack.mjs`) — off-chain check vs on-chain stateful guardrail
+
+`node demo/split-attack.mjs` runs a self-contained illustration of **why** the on-chain guardrail
+matters: two agents get the same hostile instruction — *"make 4 buys of 4 XAH, each under the 5 XAH
+per-tx limit"* (total 16 XAH, against a 10 XAH budget).
+
+- **Agent A (ungoverned)** has only an off-chain per-call limit. It approves all four — a per-call
+  check never sums the calls — and **overspends to 16 XAH**.
+- **Agent B (governed)** runs the stateful guardrail (`LIM` per-tx + `PLM` period cap + `PER`,
+  cumulative `spent` in HookState). It accepts the first two, then **rejects** the buy that would
+  breach `PLM` (on-ledger that is a `tecHOOK_REJECTED`), staying **within budget at 8 XAH**.
+
+It is an **illustrative model**, not a proof: the governed decision faithfully reimplements the
+deployed rule; the real enforcement is that rule **PROVEN for all inputs** by xahc-prover (invariant
+`period-budget`) and executing on-ledger. The core logic is exported and unit-tested in `../test.mjs`
+so it cannot silently become a strawman. Run with `--live` for the on-chain pointer (install the
+stateful guardrail on a testnet account and watch the real reject + `GET /policy/:account` decrement).
+The two live scenarios below use the simpler **per-tx** guardrail.
+
 ## The two scenarios
 
 | resource | price | vs. the 5 XAH guardrail cap | expected |
