@@ -1726,6 +1726,27 @@ async function getPolicy(client, account) {
     const candidates = [];
     candidates.push(h);
     if (Array.isArray(h?.Hooks)) for (const hh of h.Hooks) candidates.push(hh?.Hook || hh);
+    // Parameters given at install time (SetHook with CreateCode) are stored on the
+    // HookDefinition, not on the account's Hook object, which only carries overrides
+    // (measured on Xahau testnet 2026-09-03: Hook = {HookHash} only; ledger_entry
+    // hook_definition carries HookParameters + HookNamespace + HookOn). Merge the
+    // definition's defaults under the Hook object's overrides so a normally-installed
+    // guardrail is readable. Read-only; a failed definition read just leaves the
+    // candidate as-is (fail-transparent, never fabricate).
+    for (const c of [...candidates]) {
+      const hh = c?.HookHash;
+      if (typeof hh !== "string" || !/^[0-9A-Fa-f]{64}$/.test(hh)) continue;
+      if (hookParamsMap(c).has(HOOK_PARAM_LIM)) continue;
+      try {
+        const d = await client.request({ command: "ledger_entry", hook_definition: hh, ledger_index: "validated" });
+        const node = d?.result?.node;
+        if (!node) continue;
+        const merged = new Map();
+        for (const el of node.HookParameters || []) { const q = el?.HookParameter || el; if (q?.HookParameterName) merged.set(q.HookParameterName.toUpperCase(), el); }
+        for (const el of c?.HookParameters || []) { const q = el?.HookParameter || el; if (q?.HookParameterName) merged.set(q.HookParameterName.toUpperCase(), el); }
+        candidates.push({ ...c, HookParameters: [...merged.values()], HookNamespace: c?.HookNamespace || node.HookNamespace, _fromDefinition: true });
+      } catch { /* leave as-is */ }
+    }
     for (const c of candidates) {
       const params = hookParamsMap(c);
       if (params.has(HOOK_PARAM_LIM)) {
