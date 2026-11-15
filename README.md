@@ -1,5 +1,21 @@
 # exact-xahau — reference x402 facilitator for Xahau
 
+> **Correction (2026-11-15).** An internal soundness review of the prover found that `prove_period_budget`
+> (xahc-prover, commit 8125029) returns PROVEN on five planted-bug hooks that really overspend when run
+> (for example, a hook that never adds the payment to its stored spend). What that driver establishes is
+> narrower than this text said: after each accepted payment, the stored spend is at most PLM. It does
+> **not** establish that the total accepted within a period stays under PLM. The companion `prove_guardrail`
+> also returns PROVEN on a stateful hook that skips its destination check on a fresh account, and neither
+> driver looks at transactions a hook emits. The guardrail is installed for Payment transactions only, so
+> other value-moving transactions (Remit, EscrowCreate, OfferCreate, ...) are not policed by it.
+> The reference hooks were not found unsafe: `agent_guardrail_stateful` passed an independent replay (5,000
+> random payment sequences checked against its spec) and every attack in the review. A strengthened driver
+> is in progress; until it passes, read "cannot overspend" below as "each accepted Payment is within LIM,
+> goes to DST when set, and leaves the stored spend at most PLM".
+>
+> The `kv-provable-budget` extension signs the account's live on-ledger policy and remaining budget. It is
+> a signed reading of ledger state, not a proof.
+
 > **Standalone mirror.** This is the canonical standalone home of the x402-xahau
 > facilitator. It is also developed inside the **xahc** toolchain repo at
 > [`Hugegreencandle/xahc/x402-xahau`](https://github.com/Hugegreencandle/xahc/tree/main/x402-xahau),

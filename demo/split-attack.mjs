@@ -9,7 +9,8 @@
  * agent overspends its intended budget. The governed agent's on-chain stateful guardrail
  * (LIM per-tx + PLM period cap + PER period, cumulative `spent` in HookState) rejects the
  * call that would push the running total past the period budget. The ledger enforces the
- * budget; the agent cannot overspend.
+ * budget for these Payments (corrected 2026-11-15: not a proof that the agent "cannot overspend";
+ * see the correction note in README.md).
  *
  * HONESTY. This file is an ILLUSTRATIVE MODEL, not a proof. The governed decision below
  * is a faithful reimplementation of the deployed stateful guardrail's rule (slot 0x01 =
